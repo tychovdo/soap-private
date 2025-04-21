@@ -15,6 +15,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from soap import SOAP
 
+import wandb
+
+
+
 with open(sys.argv[0]) as f:
     code = f.read()
 
@@ -353,6 +357,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_loss_every", type=int, default=0, help="every how many steps to evaluate val loss?")
     parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
     parser.add_argument("--save_every", type=int, default=0, help="every how many steps to save the checkpoint")
+    parser.add_argument("--sync_opt_state", action="store_true")
     args = parser.parse_args()
 
     # args error checking and convenience variables
@@ -361,14 +366,20 @@ if __name__ == "__main__":
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     assert torch.cuda.is_available()
-    dist.init_process_group(backend='nccl')
+    #dist.init_process_group(backend='nccl')
+    dist.init_process_group(backend="gloo")
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
+
+    device = f'cuda:{ddp_local_rank % 2}'
     torch.cuda.set_device(device)
     print(f"using device: {device}")
     master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+
+    if master_process:
+        wandb.init(project='soap-mod', config=vars(args))
+        wandb.log({'ddp_world_size': ddp_world_size})
 
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
@@ -445,6 +456,7 @@ if __name__ == "__main__":
             if master_process and logfile is not None:
                 with open(logfile, "a") as f:
                     f.write("s:%d tel:%f\n" % (step, val_loss))
+                wandb.log({"val_loss": val_loss.item()}, step=step)
 
         # save the state of the training process
         if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
@@ -479,6 +491,23 @@ if __name__ == "__main__":
         # step the optimizer
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+
+        if args.sync_opt_state:
+            print('syncing opt state...')
+            for name, param in model.named_parameters():
+                if any(param is p for group in optimizer.optimizers[0].param_groups for p in group['params']):
+                    dist.all_reduce(optimizer.optimizers[0].state[param]['exp_avg'], op=dist.ReduceOp.AVG)
+                    dist.all_reduce(optimizer.optimizers[0].state[param]['exp_avg_sq'], op=dist.ReduceOp.AVG)
+
+                if any(param is p for group in optimizer.optimizers[1].param_groups for p in group['params']):
+                    dist.all_reduce(optimizer.optimizers[1].state[param]['exp_avg'], op=dist.ReduceOp.AVG)
+                    dist.all_reduce(optimizer.optimizers[1].state[param]['exp_avg_sq'], op=dist.ReduceOp.AVG)
+                    len_gg = len(optimizer.optimizers[1].state[param]['GG'])
+                    for g_i in range(len_gg):
+                        dist.all_reduce(optimizer.optimizers[1].state[param]['GG'][g_i], op=dist.ReduceOp.AVG)
+                        
+                    optimizer.optimizers[1].state[param]['Q'] = optimizer.optimizers[1].get_orthogonal_matrix_QR(optimizer.optimizers[1].state[param], 10000, False)
+
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
         torch.cuda.synchronize()
@@ -486,11 +515,13 @@ if __name__ == "__main__":
 
         dist.all_reduce(train_loss, op=dist.ReduceOp.AVG)
         tokens_per_second = ddp_world_size * B * T / (t1 - t0)
+
         print0(f"step {step+1:4d}/{args.num_iterations} | train loss {train_loss.item():.4f} | lr_scale {lr_scale:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
         # log training loss to logfile
         if master_process:
             with open(logfile, "a") as f:
                 f.write("s:%d trl:%f\n" % (step, train_loss.item()))
+                wandb.log({"train_loss": train_loss.item()}, step=step)
 
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 

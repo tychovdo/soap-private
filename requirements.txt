@@ -1,0 +1,6 @@
+numpy
+tqdm
+tiktoken
+torch
+datasets
+huggingface-hub

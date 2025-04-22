@@ -508,15 +508,16 @@ if __name__ == "__main__":
                         print("precondition")
                         len_gg = len(param_state['GG'])
                         for g_i in range(len_gg):
-                            dist.all_reduce(param_state['GG'][g_i], op=dist.ReduceOp.AVG)
+                            dist.reduce(param_state['GG'][g_i], dst=0, op=dist.ReduceOp.AVG)
                             
                         if master_process:
-                            param_state['Q'] = param_state.get_orthogonal_matrix_QR(param_state, 10000, False)
+                            param_state['Q'] = optimizer.optimizers[1].get_orthogonal_matrix_QR(param_state, 10000, False)
 
                         len_q = len(param_state['Q'])
                         for q_i in range(len_q):
-                            print('Q', ddp_rank, param_state['Q'][q_i].is_contiguous())
-                            #param_state['Q'][q_i] = param_state['Q'][q_i].contiguous()
+                            print(param_state['Q'][q_i].is_contiguous(), param_state['Q'][q_i].shape, ddp_rank)
+                            param_state['Q'][q_i] = param_state['Q'][q_i].contiguous()
+                            #print('Q', ddp_rank, param_state['Q'][q_i].is_contiguous())
                             dist.broadcast(param_state['Q'][q_i], src=0)
 
                         print("synced")

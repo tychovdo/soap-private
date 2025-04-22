@@ -357,6 +357,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
     parser.add_argument("--save_every", type=int, default=0, help="every how many steps to save the checkpoint")
     parser.add_argument("--sync_opt_state", action="store_true")
+    parser.add_argument("--fed_avg", action="store_true", help="use federated averaging instead of DDP")
     args = parser.parse_args()
 
     # args error checking and convenience variables
@@ -401,9 +402,10 @@ if __name__ == "__main__":
     print0("compiling the model...")
     model = torch.compile(model)
 
-    # here we wrap model into DDP container
-    model = DDP(model, device_ids=[ddp_local_rank])
-    raw_model = model.module # always contains the "raw" unwrapped model
+    # here we wrap model into DDP container if not using fed_avg
+    if not args.fed_avg:
+        model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module if not args.fed_avg else model # always contains the "raw" unwrapped model
 
     # set up a context manager following the desired dtype and device
     ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
@@ -491,6 +493,11 @@ if __name__ == "__main__":
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
+        if args.fed_avg:
+            # Average model parameters across all processes
+            for param in model.parameters():
+                dist.all_reduce(param.data, op=dist.ReduceOp.AVG)
+                
         if args.sync_opt_state:
             print('syncing opt state...')
             for name, param in model.named_parameters():

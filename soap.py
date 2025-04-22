@@ -408,7 +408,7 @@ class SOAP(optim.Optimizer):
 
             if not float_data:
                 Q = Q.to(original_device).type(original_type)
-            final.append(Q)
+            final.append(Q.contiguous())
         
         if merge_dims:
             if self._data_format == 'channels_last' and len(orig_shape) == 4:

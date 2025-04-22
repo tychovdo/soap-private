@@ -12,7 +12,6 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-
 from soap import SOAP
 
 import wandb
@@ -240,10 +239,10 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, precondition_frequency):
         optimizer = CombinedOptimizer([
             torch.optim.AdamW(self.lm_head.parameters(), lr=0.0018, betas=betas, weight_decay=0),
-            SOAP(self.transformer.h.parameters(), lr=learning_rate, betas=(.95, .95), weight_decay=0, precondition_frequency=10)
+            SOAP(self.transformer.h.parameters(), lr=learning_rate, betas=(.95, .95), weight_decay=0, precondition_frequency=precondition_frequency)
             #OrthogonalNesterov(self.transformer.h.parameters(), lr=10 * learning_rate, momentum=0.95)
         ])
         return optimizer
@@ -366,13 +365,12 @@ if __name__ == "__main__":
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
     assert torch.cuda.is_available()
-    #dist.init_process_group(backend='nccl')
-    dist.init_process_group(backend="gloo")
+    dist.init_process_group(backend='nccl')
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     ddp_world_size = int(os.environ['WORLD_SIZE'])
 
-    device = f'cuda:{ddp_local_rank % 2}'
+    device = f'cuda:{ddp_local_rank}'
     torch.cuda.set_device(device)
     print(f"using device: {device}")
     master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
@@ -411,8 +409,9 @@ if __name__ == "__main__":
     ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
     # init the optimizer
+    precondition_frequency = 10000000000 if args.sync_opt_state else 10
     optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
-                                               learning_rate=args.learning_rate, betas=(0.9, 0.95))
+                                               learning_rate=args.learning_rate, betas=(0.9, 0.95), precondition_frequency=precondition_frequency)
 
     # learning rate decay scheduler (linear warmup and warmdown)
     def get_lr(it):
@@ -496,17 +495,32 @@ if __name__ == "__main__":
             print('syncing opt state...')
             for name, param in model.named_parameters():
                 if any(param is p for group in optimizer.optimizers[0].param_groups for p in group['params']):
-                    dist.all_reduce(optimizer.optimizers[0].state[param]['exp_avg'], op=dist.ReduceOp.AVG)
-                    dist.all_reduce(optimizer.optimizers[0].state[param]['exp_avg_sq'], op=dist.ReduceOp.AVG)
+                    param_state = optimizer.optimizers[0].state[param]
+                    dist.all_reduce(param_state['exp_avg'], op=dist.ReduceOp.AVG)
+                    dist.all_reduce(param_state['exp_avg_sq'], op=dist.ReduceOp.AVG)
 
                 if any(param is p for group in optimizer.optimizers[1].param_groups for p in group['params']):
-                    dist.all_reduce(optimizer.optimizers[1].state[param]['exp_avg'], op=dist.ReduceOp.AVG)
-                    dist.all_reduce(optimizer.optimizers[1].state[param]['exp_avg_sq'], op=dist.ReduceOp.AVG)
-                    len_gg = len(optimizer.optimizers[1].state[param]['GG'])
-                    for g_i in range(len_gg):
-                        dist.all_reduce(optimizer.optimizers[1].state[param]['GG'][g_i], op=dist.ReduceOp.AVG)
-                        
-                    optimizer.optimizers[1].state[param]['Q'] = optimizer.optimizers[1].get_orthogonal_matrix_QR(optimizer.optimizers[1].state[param], 10000, False)
+                    param_state = optimizer.optimizers[1].state[param]
+                    dist.all_reduce(param_state['exp_avg'], op=dist.ReduceOp.AVG)
+                    dist.all_reduce(param_state['exp_avg_sq'], op=dist.ReduceOp.AVG)
+                    PRECONDITION_FREQUENCY = 10
+                    if param_state['step'] > 0 and param_state['step'] % PRECONDITION_FREQUENCY == 0:
+                        print("precondition")
+                        len_gg = len(param_state['GG'])
+                        for g_i in range(len_gg):
+                            dist.all_reduce(param_state['GG'][g_i], op=dist.ReduceOp.AVG)
+                            
+                        if master_process:
+                            param_state['Q'] = param_state.get_orthogonal_matrix_QR(param_state, 10000, False)
+
+                        len_q = len(param_state['Q'])
+                        for q_i in range(len_q):
+                            print('Q', ddp_rank, param_state['Q'][q_i].is_contiguous())
+                            #param_state['Q'][q_i] = param_state['Q'][q_i].contiguous()
+                            dist.broadcast(param_state['Q'][q_i], src=0)
+
+                        print("synced")
+                            
 
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
